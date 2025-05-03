@@ -21,7 +21,7 @@ Go to **File → Import**, and import the provided `MCQ Basic.apkg`. You will ge
 
 ### 2. Install the Add-on
 
-* **Via AnkiWeb**: Use the code (TBD) in **Tools → Add-ons → Get Add-ons…**
+* **Via AnkiWeb**: Use the code (TBD) in **Tools → Add-ons → Get Add-ons → Enter this code: 633738362 → Press OK**.
 * **Manual**: Clone this repo into your `addons21` folder or use "Install from file…" with the `mcq_generator.ankiaddon`.
 
 
