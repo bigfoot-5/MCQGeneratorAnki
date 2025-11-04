@@ -1,5 +1,18 @@
 import random
+import sys
+import os
+
+# Add vendor directory to Python path for bundled dependencies
+# This allows us to ship libraries with the addon
+_addon_dir = os.path.dirname(os.path.abspath(__file__))
+_vendor_dir = os.path.join(_addon_dir, 'vendor')
+if os.path.exists(_vendor_dir):
+    # Insert at index 0 to prioritize vendored packages over system packages
+    if _vendor_dir not in sys.path:
+        sys.path.insert(0, _vendor_dir)
+
 import requests
+from dotenv import load_dotenv
 from aqt import mw
 from aqt.qt import QAction, QInputDialog, QDialog, \
     QVBoxLayout, QProgressBar, QApplication, \
@@ -7,11 +20,16 @@ from aqt.qt import QAction, QInputDialog, QDialog, \
 from aqt.utils import showInfo
 from aqt import gui_hooks
 
+# Load environment variables from .env file (if it exists)
+load_dotenv()
+
 # ——— Load Configuration ———
 config = mw.addonManager.getConfig(__name__)
+# API_KEY = os.getenv("OPENAI_API_KEY")
+# API_URL = os.getenv("OPENAI_API_URL")
 API_KEY = config.get("api_key")
 API_URL = config.get("api_url")
-AI_MODEL = config.get("model")
+AI_MODEL = config.get("OPENAI_MODEL")
 PROMPT_TEMPLATE = config.get("prompt_template")
 TEMPERATURE = float(config.get("temperature", 1.0))
 
@@ -23,10 +41,12 @@ def non_blocking_wait(seconds):
 # ——— Core API Call with Retry Logic ———
 def generate_sentence_for_word(word, max_retries=5):
     """
-    Call GroqCloud to generate a sentence with a blank for the given word/phrase.
+    Call OpenAI API to generate a sentence with a blank for the given word/phrase.
     Implements retry logic on HTTP 429 errors.
     Returns the sentence as plain text.
     """
+    import time
+
     level = random.choice(['A1', 'A2', 'B1', 'B2', 'C1', 'C2'])
     prompt = PROMPT_TEMPLATE.format(word=word, level=level)
     headers = {
@@ -34,7 +54,7 @@ def generate_sentence_for_word(word, max_retries=5):
         "Content-Type": "application/json"
     }
     payload = {
-        "model": AI_MODEL,
+        "model": AI_MODEL,  # Example: "gpt-3.5-turbo" or "gpt-4o-mini"
         "messages": [{"role": "user", "content": prompt}],
         "temperature": TEMPERATURE
     }
@@ -42,23 +62,27 @@ def generate_sentence_for_word(word, max_retries=5):
     retries = 0
     while retries <= max_retries:
         try:
-            res = requests.post(API_URL, headers=headers, json=payload)
+            res = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload)
             if res.status_code == 429:
-                wait_time = 60  # Wait 1 minute
-                showInfo(f"Rate limit reached. Don't cancel. Retrying in {wait_time} seconds...")
+                wait_time = 30
+                showInfo(f"Rate limit reached. Retrying in {wait_time} seconds...")
                 non_blocking_wait(wait_time)
                 retries += 1
                 continue
             res.raise_for_status()
             data = res.json()
-            content = data['choices'][0]['message']['content'].strip()
+            content = data["choices"][0]["message"]["content"].strip()
             return content
         except requests.exceptions.RequestException as e:
             showInfo(f"HTTP error: {e}")
-            raise
+            retries += 1
+            if retries > max_retries:
+                raise
+            time.sleep(3)
         except Exception as e:
             showInfo(f"Error processing response: {e}")
             raise
+
     showInfo("Maximum retries exceeded. Please try again later.")
     return None
 

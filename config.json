@@ -1,7 +1,7 @@
 {
-  "api_key": "your_api_key_here",
-  "api_url": "https://api.groq.com/openai/v1/chat/completions",
-  "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+  "api_key": "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",
+  "api_url": "https://api.openai.com/v1/chat/completions",
+  "model": "gpt-3.5-turbo",
   "prompt_template": "Generate a normal length English sentence using the word or phrase '{word}', replacing the target word or phrase with a blank (_____). Difficulty should be {level} based on CEFR. Return only the sentence.",
   "temperature": 1.5
 }

@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+venv/
+test_results.csv
+word_cards.csv
+
+# Vendor directory - uncomment if you want to exclude from git
+# vendor/
