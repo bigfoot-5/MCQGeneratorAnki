@@ -12,6 +12,7 @@ import sys
 import os
 import csv
 import json
+import time
 from typing import List, Dict, Optional
 
 # Mock Anki components
@@ -40,9 +41,10 @@ class MockAQT:
     def showError(self, msg):
         print(f"[ERROR] {msg}")
 
-# Set up vendor directory (same as main.py)
+# Set up vendor and user_files directories (same as main.py)
 _addon_dir = os.path.dirname(os.path.abspath(__file__))
 _vendor_dir = os.path.join(_addon_dir, 'vendor')
+_user_files_dir = os.path.join(_addon_dir, 'user_files')
 if os.path.exists(_vendor_dir):
     if _vendor_dir not in sys.path:
         sys.path.insert(0, _vendor_dir)
@@ -60,16 +62,42 @@ sys.modules['aqt'].gui_hooks = type(sys)('gui_hooks')
 import requests
 from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
+# Load environment variables using explicit paths to match main.py behavior
+load_dotenv(os.path.join(_addon_dir, ".env"), override=False)
+if os.path.isdir(_user_files_dir):
+    load_dotenv(os.path.join(_user_files_dir, ".env"), override=False)
 
-# Load config
+# Load config (for any non-secret defaults the user may keep there)
 config = MockMW().addonManager
-API_KEY = config.get("api_key") or os.getenv("OPENAI_API_KEY")
-API_URL = config.get("api_url") or os.getenv("OPENAI_API_URL")
-AI_MODEL = config.get("OPENAI_MODEL") or config.get("model")  # Try both keys
-PROMPT_TEMPLATE = config.get("prompt_template")
-TEMPERATURE = float(config.get("temperature", 1.0))
+
+# Mirror configuration resolution from main.py
+DEFAULT_PROMPT = (
+    "Generate a normal length English sentence using the word or phrase '{word}', "
+    "replacing the target word or phrase with a blank (_____). Difficulty should be "
+    "{level} based on CEFR. Return only the sentence."
+)
+
+LLM_PROVIDER = (os.getenv("LLM_PROVIDER") or "openai").strip().lower()
+
+# OpenAI settings
+API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
+API_URL = (os.getenv("OPENAI_API_URL") or "https://api.openai.com/v1/chat/completions").strip()
+AI_MODEL = (os.getenv("OPENAI_MODEL") or "").strip()
+
+# Ollama (local SLM) settings
+OLLAMA_URL = (os.getenv("OLLAMA_URL") or "http://localhost:11434/api/chat").strip()
+OLLAMA_MODEL = (os.getenv("OLLAMA_MODEL") or "gemma3:1b").strip()
+
+# Prompt + sampling settings
+PROMPT_TEMPLATE = (
+    os.getenv("OPENAI_PROMPT_TEMPLATE")
+    or os.getenv("OLLAMA_PROMPT_TEMPLATE")
+    or DEFAULT_PROMPT
+)
+try:
+    TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE"))
+except (TypeError, ValueError):
+    TEMPERATURE = 1.5
 
 
 def show_info(msg):
@@ -91,12 +119,53 @@ def generate_sentence_for_word(word: str, max_retries: int = 5) -> Optional[str]
     """
     import time
 
-    if not API_KEY:
-        print(f"[ERROR] API_KEY not set. Please configure in config.json or .env file")
-        return None
-    
     level = random.choice(['A1', 'A2', 'B1', 'B2', 'C1', 'C2'])
     prompt = PROMPT_TEMPLATE.format(word=word, level=level)
+
+    if LLM_PROVIDER == "ollama":
+        if not OLLAMA_MODEL:
+            print("[ERROR] Ollama model is not configured. Set OLLAMA_MODEL or update your .env file.")
+            return None
+
+        payload = {
+            "model": OLLAMA_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "options": {"temperature": TEMPERATURE},
+            "stream": False,
+        }
+
+        try:
+            print(f"[SLM] Generating sentence for '{word}' using Ollama model '{OLLAMA_MODEL}'...")
+            res = requests.post(OLLAMA_URL, json=payload, timeout=60)
+            res.raise_for_status()
+            data = res.json()
+            # Depending on Ollama version, `message` may be nested differently.
+            content = ""
+            if isinstance(data, dict):
+                if "message" in data and isinstance(data["message"], dict):
+                    content = data["message"].get("content", "")
+                elif "content" in data:
+                    content = data["content"]
+            content = (content or "").strip()
+            if not content:
+                print("[ERROR] Empty response from Ollama.")
+                return None
+            print(f"[SUCCESS] Generated (Ollama): {content}")
+            return content
+        except requests.exceptions.RequestException as e:
+            show_info(f"HTTP error calling Ollama: {e}")
+        except Exception as e:
+            show_info(f"Error processing Ollama response: {e}")
+        return None
+
+    # Default to OpenAI
+    if not API_KEY:
+        print("[ERROR] OpenAI API key is not configured. Set it via .env or user_files/api_key.txt.")
+        return None
+    if not AI_MODEL:
+        print("[ERROR] OpenAI model is not configured. Set it via .env or user_files/model.txt.")
+        return None
+
     headers = {
         "Authorization": f"Bearer {API_KEY}",
         "Content-Type": "application/json"
@@ -111,8 +180,7 @@ def generate_sentence_for_word(word: str, max_retries: int = 5) -> Optional[str]
     while retries <= max_retries:
         try:
             print(f"[API] Generating sentence for '{word}' (attempt {retries + 1})...")
-            res = requests.post(API_URL or "https://api.openai.com/v1/chat/completions", 
-                              headers=headers, json=payload, timeout=30)
+            res = requests.post(API_URL, headers=headers, json=payload, timeout=30)
             if res.status_code == 429:
                 wait_time = 30
                 show_info(f"Rate limit reached. Retrying in {wait_time} seconds...")
@@ -122,7 +190,7 @@ def generate_sentence_for_word(word: str, max_retries: int = 5) -> Optional[str]
             res.raise_for_status()
             data = res.json()
             content = data["choices"][0]["message"]["content"].strip()
-            print(f"[SUCCESS] Generated: {content}")
+            print(f"[SUCCESS] Generated (OpenAI): {content}")
             return content
         except requests.exceptions.RequestException as e:
             show_info(f"HTTP error: {e}")
@@ -256,7 +324,7 @@ def main():
     # Configuration
     csv_path = os.path.join(os.path.dirname(__file__), 'word_cards.csv')
     output_path = os.path.join(os.path.dirname(__file__), 'test_results.csv')
-    test_count = 3  # Number of words to test
+    test_count = 1 # Number of words to test
     
     # Check if CSV exists
     if not os.path.exists(csv_path):

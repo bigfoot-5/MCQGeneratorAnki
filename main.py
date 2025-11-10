@@ -6,6 +6,7 @@ import os
 # This allows us to ship libraries with the addon
 _addon_dir = os.path.dirname(os.path.abspath(__file__))
 _vendor_dir = os.path.join(_addon_dir, 'vendor')
+_user_files_dir = os.path.join(_addon_dir, 'user_files')
 if os.path.exists(_vendor_dir):
     # Insert at index 0 to prioritize vendored packages over system packages
     if _vendor_dir not in sys.path:
@@ -20,18 +21,40 @@ from aqt.qt import QAction, QInputDialog, QDialog, \
 from aqt.utils import showInfo
 from aqt import gui_hooks
 
-# Load environment variables from .env file (if it exists)
-load_dotenv()
+# Load environment variables from .env file(s) if they exist.
+# We explicitly point to the addon directory so Anki's working directory does not matter.
+load_dotenv(os.path.join(_addon_dir, ".env"), override=False)
+if os.path.isdir(_user_files_dir):
+    load_dotenv(os.path.join(_user_files_dir, ".env"), override=False)
+
 
 # ——— Load Configuration ———
-config = mw.addonManager.getConfig(__name__)
-# API_KEY = os.getenv("OPENAI_API_KEY")
-# API_URL = os.getenv("OPENAI_API_URL")
-API_KEY = config.get("api_key")
-API_URL = config.get("api_url")
-AI_MODEL = config.get("OPENAI_MODEL")
-PROMPT_TEMPLATE = config.get("prompt_template")
-TEMPERATURE = float(config.get("temperature", 1.0))
+DEFAULT_PROMPT_TEMPLATE = (
+    "Generate a normal length English sentence using the word or phrase '{word}', "
+    "replacing the target word or phrase with a blank (_____). Difficulty should be "
+    "{level} based on CEFR. Return only the sentence."
+)
+
+LLM_PROVIDER = (os.getenv("LLM_PROVIDER") or "openai").strip().lower()
+
+# OpenAI settings
+API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
+API_URL = (os.getenv("OPENAI_API_URL") or "https://api.openai.com/v1/chat/completions").strip()
+AI_MODEL = (os.getenv("OPENAI_MODEL") or "").strip()
+
+# Ollama (local SLM) settings
+OLLAMA_URL = (os.getenv("OLLAMA_URL") or "http://localhost:11434/api/chat").strip()
+OLLAMA_MODEL = (os.getenv("OLLAMA_MODEL") or "gemma3:1b").strip()
+
+PROMPT_TEMPLATE = (
+    os.getenv("OPENAI_PROMPT_TEMPLATE")
+    or os.getenv("OLLAMA_PROMPT_TEMPLATE")
+    or DEFAULT_PROMPT_TEMPLATE
+)
+try:
+    TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE"))
+except (TypeError, ValueError):
+    TEMPERATURE = 1.5
 
 def non_blocking_wait(seconds):
     loop = QEventLoop()
@@ -48,7 +71,50 @@ def generate_sentence_for_word(word, max_retries=5):
     import time
 
     level = random.choice(['A1', 'A2', 'B1', 'B2', 'C1', 'C2'])
-    prompt = PROMPT_TEMPLATE.format(word=word, level=level)
+    try:
+        prompt = PROMPT_TEMPLATE.format(word=word, level=level)
+    except Exception as e:
+        showInfo(f"Prompt template is invalid: {e}")
+        return None
+
+    if LLM_PROVIDER == "ollama":
+        if not OLLAMA_MODEL:
+            showInfo("Ollama model is not configured. Set OLLAMA_MODEL in your .env file.")
+            return None
+        payload = {
+            "model": OLLAMA_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "options": {"temperature": TEMPERATURE},
+            "stream": False,
+        }
+        try:
+            res = requests.post(OLLAMA_URL, json=payload, timeout=60)
+            res.raise_for_status()
+            data = res.json()
+            content = ""
+            if isinstance(data, dict):
+                if "message" in data and isinstance(data["message"], dict):
+                    content = data["message"].get("content", "")
+                elif "content" in data:
+                    content = data["content"]
+            content = (content or "").strip()
+            if not content:
+                showInfo("Ollama returned an empty response.")
+                return None
+            return content
+        except requests.exceptions.RequestException as e:
+            showInfo(f"HTTP error when calling Ollama: {e}")
+            return None
+        except Exception as e:
+            showInfo(f"Error processing Ollama response: {e}")
+            return None
+
+    if not API_KEY:
+        showInfo("OpenAI API key is not configured. Set it via .env or user_files/api_key.txt.")
+        return None
+    if not AI_MODEL:
+        showInfo("OpenAI model is not configured. Set it via .env or user_files/model.txt.")
+        return None
     headers = {
         "Authorization": f"Bearer {API_KEY}",
         "Content-Type": "application/json"
@@ -62,7 +128,7 @@ def generate_sentence_for_word(word, max_retries=5):
     retries = 0
     while retries <= max_retries:
         try:
-            res = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload)
+            res = requests.post(API_URL, headers=headers, json=payload)
             if res.status_code == 429:
                 wait_time = 30
                 showInfo(f"Rate limit reached. Retrying in {wait_time} seconds...")
