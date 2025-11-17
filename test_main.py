@@ -13,6 +13,7 @@ import os
 import csv
 import json
 import time
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional
 
 # Mock Anki components
@@ -62,6 +63,21 @@ sys.modules['aqt'].gui_hooks = type(sys)('gui_hooks')
 import requests
 from dotenv import load_dotenv
 
+try:
+    from news_fetcher import BASE_PARAMS as NEWS_BASE_PARAMS, NEWS_API_URL, fetch_news as newsapi_fetch_news
+except ImportError:
+    NEWS_BASE_PARAMS = None
+    NEWS_API_URL = "https://newsapi.org/v2/everything"
+    newsapi_fetch_news = None
+
+if newsapi_fetch_news is None:
+
+    def newsapi_fetch_news(api_key: str, params: Dict[str, str]) -> Dict:
+        headers = {"Authorization": api_key}
+        response = requests.get(NEWS_API_URL, headers=headers, params=params, timeout=30)
+        response.raise_for_status()
+        return response.json()
+
 # Load environment variables using explicit paths to match main.py behavior
 load_dotenv(os.path.join(_addon_dir, ".env"), override=False)
 if os.path.isdir(_user_files_dir):
@@ -72,9 +88,28 @@ config = MockMW().addonManager
 
 # Mirror configuration resolution from main.py
 DEFAULT_PROMPT = (
-    "Generate a normal length English sentence using the word or phrase '{word}', "
-    "replacing the target word or phrase with a blank (_____). Difficulty should be "
-    "{level} based on CEFR. Return only the sentence."
+    """
+   You are creating a two-sentence news-style output for an English-learner exercise.
+
+Inputs (do not alter):
+- Target word or phrase: {word}
+- Definition to use as guidance: {definition}
+- News article title: {article_title}
+- News article summary: {article_summary}
+
+Output requirements (strict — follow exactly):
+1. Produce exactly **two sentences** and nothing else (no commentary, no bullets, no metadata).
+2. Sentence 1 must be the **unchanged** news article excerpt provided in {article_summary}. Do **not** modify it in any way and do not add blanks to it.
+3. Sentence 2 must be a short, natural-sounding **continuation or extension** of the article excerpt (an extra sentence that could plausibly follow the excerpt).
+4. In Sentence 2, **replace the target word or phrase with a single blank written exactly as seven underscores**: `_______`. The blank must appear **only** in Sentence 2 (never in Sentence 1).
+5. Use the provided {definition} to shape the meaning of Sentence 2 so the blank is contextually constrained and the definition would make the blank answerable by the target word/phrase. Do not restate the definition verbatim.
+6. Do **not** reveal the answer anywhere (no synonyms, no parenthetical hints, no further blanks). The model must not output the target word or phrase in any form.
+7. Keep both sentences short and clear (each ≤ 30 words). Prefer neutral, factual tone consistent with news.
+8. Return only the two sentences (Sentence 1 + Sentence 2). No extra whitespace, no headings, no punctuation outside the sentences.
+
+If you cannot produce a natural continuation that fits the definition, produce a plausible imaginary continuation sentence that follows the excerpt and still conforms to all rules above.
+
+"""
 )
 
 LLM_PROVIDER = (os.getenv("LLM_PROVIDER") or "openai").strip().lower()
@@ -100,6 +135,44 @@ except (TypeError, ValueError):
     TEMPERATURE = 1.5
 
 
+def load_news_articles(limit: Optional[int] = None) -> List[Dict[str, str]]:
+    """Fetch recent news articles to provide context for MCQ generation."""
+    api_key = (os.getenv("NEWS_API_KEY") or "").strip()
+    if not api_key:
+        print("[WARNING] NEWS_API_KEY not configured; proceeding without article context.")
+        return []
+
+    params = dict(NEWS_BASE_PARAMS) if NEWS_BASE_PARAMS else {
+        "q": "technology",
+        "pageSize": 100,
+        "sortBy": "publishedAt",
+    }
+
+    if NEWS_API_URL.endswith("everything"):
+        now = datetime.now(timezone.utc)
+        week_ago = now - timedelta(days=7)
+        params.setdefault("from", week_ago.isoformat(timespec="seconds"))
+        params.setdefault("to", now.isoformat(timespec="seconds"))
+
+    try:
+        data = newsapi_fetch_news(api_key, params)
+    except requests.HTTPError as exc:
+        print(f"[ERROR] Failed to fetch news articles: {exc}")
+        if exc.response is not None:
+            print(exc.response.text)
+        return []
+    except Exception as exc:
+        print(f"[ERROR] Unexpected error fetching news articles: {exc}")
+        return []
+
+    articles = data.get("articles", []) if isinstance(data, dict) else []
+    if limit is not None:
+        articles = articles[:limit]
+
+    print(f"[INFO] Loaded {len(articles)} news articles for context.")
+    return articles
+
+
 def show_info(msg):
     """Mock showInfo function"""
     print(f"[INFO] {msg}")
@@ -111,7 +184,31 @@ def non_blocking_wait(seconds):
 
 
 # Core API Call with Retry Logic (from main.py)
-def generate_sentence_for_word(word: str, max_retries: int = 5) -> Optional[str]:
+def _build_prompt(
+    word: str,
+    definition: Optional[str],
+    article: Optional[Dict[str, str]],
+) -> str:
+    article = article or {}
+    article_title = (article.get("title") or "No title provided").strip()
+    article_summary = (
+        article.get("description") or article.get("summary") or "No summary provided"
+    ).strip()
+    clean_definition = (definition or "No definition provided").strip().replace("\n", " ")
+    return PROMPT_TEMPLATE.format(
+        word=word,
+        definition=clean_definition,
+        article_title=article_title,
+        article_summary=article_summary,
+    )
+
+
+def generate_sentence_for_word(
+    word: str,
+    definition: Optional[str] = None,
+    article: Optional[Dict[str, str]] = None,
+    max_retries: int = 5
+) -> Optional[str]:
     """
     Call OpenAI API to generate a sentence with a blank for the given word/phrase.
     Implements retry logic on HTTP 429 errors.
@@ -119,8 +216,7 @@ def generate_sentence_for_word(word: str, max_retries: int = 5) -> Optional[str]
     """
     import time
 
-    level = random.choice(['A1', 'A2', 'B1', 'B2', 'C1', 'C2'])
-    prompt = PROMPT_TEMPLATE.format(word=word, level=level)
+    prompt = _build_prompt(word, definition, article)
 
     if LLM_PROVIDER == "ollama":
         if not OLLAMA_MODEL:
@@ -135,7 +231,11 @@ def generate_sentence_for_word(word: str, max_retries: int = 5) -> Optional[str]
         }
 
         try:
-            print(f"[SLM] Generating sentence for '{word}' using Ollama model '{OLLAMA_MODEL}'...")
+            article_title = (article or {}).get("title") if article else None
+            print(
+                f"[SLM] Generating sentence for '{word}' using Ollama model '{OLLAMA_MODEL}'"
+                + (f" with article '{article_title}'." if article_title else ".")
+            )
             res = requests.post(OLLAMA_URL, json=payload, timeout=60)
             res.raise_for_status()
             data = res.json()
@@ -179,7 +279,9 @@ def generate_sentence_for_word(word: str, max_retries: int = 5) -> Optional[str]
     retries = 0
     while retries <= max_retries:
         try:
-            print(f"[API] Generating sentence for '{word}' (attempt {retries + 1})...")
+            article_title = (article or {}).get("title") if article else None
+            context_msg = f" with article '{article_title}'" if article_title else ""
+            print(f"[API] Generating sentence for '{word}'{context_msg} (attempt {retries + 1})...")
             res = requests.post(API_URL, headers=headers, json=payload, timeout=30)
             if res.status_code == 429:
                 wait_time = 30
@@ -226,7 +328,11 @@ def load_csv_data(csv_path: str) -> List[Dict[str, str]]:
     return words
 
 
-def generate_mcq_for_words(words: List[Dict[str, str]], test_count: int = 3) -> List[Dict[str, str]]:
+def generate_mcq_for_words(
+    words: List[Dict[str, str]],
+    articles: List[Dict[str, str]],
+    test_count: int = 3
+) -> List[Dict[str, str]]:
     """
     Generate MCQs for given words using local distractors.
     Similar to generate_mcq_for_cards in main.py but works with CSV data.
@@ -254,6 +360,7 @@ def generate_mcq_for_words(words: List[Dict[str, str]], test_count: int = 3) -> 
         word = word_data['Word']
         if not word:
             continue
+        definition = word_data.get('Back', '')
         
         print(f"\n[{index}/{len(test_words)}] Processing: {word}")
         
@@ -265,9 +372,14 @@ def generate_mcq_for_words(words: List[Dict[str, str]], test_count: int = 3) -> 
         
         distractors = random.sample(others, 3)
         
+        # Choose article context (cycle if fewer articles than words)
+        article = articles[(index - 1) % len(articles)] if articles else None
+        if article:
+            print(f"  Article: {article.get('title', 'Untitled article')}")
+
         # Generate sentence
         try:
-            sentence = generate_sentence_for_word(word)
+            sentence = generate_sentence_for_word(word, definition=definition, article=article)
             if sentence is None:
                 print(f"[SKIP] Failed to generate sentence for {word}")
                 continue
@@ -279,6 +391,9 @@ def generate_mcq_for_words(words: List[Dict[str, str]], test_count: int = 3) -> 
         options = [word] + distractors
         random.shuffle(options)
         
+        filled_sentence = sentence.replace("_____", word, 1) if sentence else ""
+        filled_sentence = filled_sentence.replace("_", "")
+
         result = {
             'Word': word,
             'SentenceBlank': sentence,
@@ -286,7 +401,10 @@ def generate_mcq_for_words(words: List[Dict[str, str]], test_count: int = 3) -> 
             'OptionB': options[1],
             'OptionC': options[2],
             'OptionD': options[3],
-            'Answer': word,
+            'Answer': filled_sentence or word,
+            'ArticleTitle': article.get('title') if article else '',
+            'ArticleSource': ((article or {}).get('source') or {}).get('name', '') if article else '',
+            'ArticleDescription': article.get('description') if article else '',
         }
         
         results.append(result)
@@ -305,7 +423,18 @@ def save_results_to_csv(results: List[Dict[str, str]], output_path: str):
         print("[WARNING] No results to save")
         return
     
-    fieldnames = ['Word', 'SentenceBlank', 'OptionA', 'OptionB', 'OptionC', 'OptionD', 'Answer']
+    fieldnames = [
+        'Word',
+        'SentenceBlank',
+        'OptionA',
+        'OptionB',
+        'OptionC',
+        'OptionD',
+        'Answer',
+        'ArticleTitle',
+        'ArticleSource',
+        'ArticleDescription',
+    ]
     
     with open(output_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -338,10 +467,14 @@ def main():
     print(f"  Model: {AI_MODEL}")
     print(f"  Temperature: {TEMPERATURE}")
     print(f"  API Key: {'***' + API_KEY[-4:] if API_KEY else 'NOT SET'}")
+    print(f"  LLM Provider: {LLM_PROVIDER}")
     
-    if not API_KEY:
-        print("\n[ERROR] API_KEY not configured!")
-        print("Please set it in config.json or .env file")
+    if LLM_PROVIDER == "openai" and not API_KEY:
+        print("\n[ERROR] OPENAI_API_KEY not configured!")
+        print("Please set it in your .env file or environment variables.")
+        return
+    if LLM_PROVIDER == "openai" and not AI_MODEL:
+        print("\n[ERROR] OPENAI_MODEL not configured! Set it in your .env file or environment variables.")
         return
     
     # Load words from CSV
@@ -353,8 +486,13 @@ def main():
         print("[ERROR] No words found in CSV file")
         return
     
+    # Load news articles for context
+    articles = load_news_articles(limit=len(words))
+    if not articles:
+        print("[WARNING] Proceeding without news article context.")
+    
     # Generate MCQs
-    results = generate_mcq_for_words(words, test_count=test_count)
+    results = generate_mcq_for_words(words, articles, test_count=test_count)
     
     if results:
         # Save results

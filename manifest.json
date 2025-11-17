@@ -1,9 +1,9 @@
 {
-  "package": "mcq_generator",
-  "name": "MCQ Generator with AI for Vocabulary Practice",
+  "package": "mcq_generator with News",
+  "name": "MCQ Generator with News",
   "mod": 1,
-  "author": "Saif Mohammed",
-  "description": "Generates MCQs using AI API",
+  "author": "Karthik Talluri",
+  "description": "Generates MCQs using AI API with News",
   "version": "1.0.0",
   "min_point_version": 20120
 }

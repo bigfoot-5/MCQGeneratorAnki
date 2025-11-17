@@ -1,6 +1,8 @@
 import random
 import sys
 import os
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional
 
 # Add vendor directory to Python path for bundled dependencies
 # This allows us to ship libraries with the addon
@@ -21,6 +23,23 @@ from aqt.qt import QAction, QInputDialog, QDialog, \
 from aqt.utils import showInfo
 from aqt import gui_hooks
 
+try:
+    from news_fetcher import (
+        BASE_PARAMS as NEWS_BASE_PARAMS,
+        NEWS_API_URL,
+        fetch_news as newsapi_fetch_news,
+    )
+except ImportError:
+    NEWS_BASE_PARAMS = None
+    NEWS_API_URL = "https://newsapi.org/v2/everything"
+
+    def newsapi_fetch_news(api_key: str, params: Dict[str, str]) -> Dict:
+        """Fallback NewsAPI fetcher if news_fetcher module is unavailable."""
+        headers = {"Authorization": api_key}
+        response = requests.get(NEWS_API_URL, headers=headers, params=params, timeout=30)
+        response.raise_for_status()
+        return response.json()
+
 # Load environment variables from .env file(s) if they exist.
 # We explicitly point to the addon directory so Anki's working directory does not matter.
 load_dotenv(os.path.join(_addon_dir, ".env"), override=False)
@@ -30,9 +49,27 @@ if os.path.isdir(_user_files_dir):
 
 # ——— Load Configuration ———
 DEFAULT_PROMPT_TEMPLATE = (
-    "Generate a normal length English sentence using the word or phrase '{word}', "
-    "replacing the target word or phrase with a blank (_____). Difficulty should be "
-    "{level} based on CEFR. Return only the sentence."
+    """
+    You are creating a two-sentence news-style output for an English-learner exercise.
+
+    Inputs (do not alter):
+    - Target word or phrase: {word}
+    - Definition to use as guidance: {definition}
+    - News article title: {article_title}
+    - News article summary: {article_summary}
+
+    Output requirements (strict — follow exactly):
+    1. Produce exactly two sentences and nothing else (no commentary, no bullets, no metadata).
+    2. Sentence 1 must be the unchanged news article excerpt provided in {article_summary}. Do not modify it in any way and do not add blanks to it.
+    3. Sentence 2 must be a short, natural-sounding continuation or extension of the article excerpt (an extra sentence that could plausibly follow the excerpt).
+    4. In Sentence 2, replace the target word or phrase with a single blank written exactly as seven underscores: _______. The blank must appear only in Sentence 2 (never in Sentence 1).
+    5. Use the provided {definition} to shape the meaning of Sentence 2 so the blank is contextually constrained and the definition would make the blank answerable by the target word/phrase. Do not restate the definition verbatim.
+    6. Do not reveal the answer anywhere (no synonyms, no parenthetical hints, no further blanks). The model must not output the target word or phrase in any form.
+    7. Keep both sentences short and clear (each ≤ 30 words). Prefer neutral, factual tone consistent with news.
+    8. Return only the two sentences (Sentence 1 + Sentence 2). No extra whitespace, no headings, no punctuation outside the sentences.
+
+    If you cannot produce a natural continuation that fits the definition, produce a plausible imaginary continuation sentence that follows the excerpt and still conforms to all rules above.
+    """
 )
 
 LLM_PROVIDER = (os.getenv("LLM_PROVIDER") or "openai").strip().lower()
@@ -61,8 +98,95 @@ def non_blocking_wait(seconds):
     QTimer.singleShot(int(seconds * 1000), loop.quit)
     loop.exec()
 
+
+def _build_prompt(
+    word: str,
+    definition: Optional[str],
+    article: Optional[Dict[str, str]],
+) -> str:
+    article = article or {}
+    article_title = (article.get("title") or "No title provided").strip()
+    article_summary = (
+        article.get("description") or article.get("summary") or "No summary provided"
+    ).strip()
+    clean_definition = (definition or "No definition provided").strip().replace("\n", " ")
+    return PROMPT_TEMPLATE.format(
+        word=word,
+        definition=clean_definition,
+        article_title=article_title,
+        article_summary=article_summary,
+    )
+
+
+def load_news_articles(limit: Optional[int] = None) -> List[Dict[str, str]]:
+    """Fetch recent news articles to provide context for MCQ generation."""
+    api_key = (os.getenv("NEWS_API_KEY") or "").strip()
+    if not api_key:
+        print("[MCQGenerator] NEWS_API_KEY not configured; proceeding without article context.")
+        return []
+
+    params = dict(NEWS_BASE_PARAMS or {
+        "q": "technology",
+        "pageSize": 100,
+        "sortBy": "publishedAt",
+        "sources": "techcrunch"
+    })
+
+    if NEWS_API_URL.endswith("everything"):
+        now = datetime.now(timezone.utc)
+        week_ago = now - timedelta(days=7)
+        params.setdefault("from", week_ago.isoformat(timespec="seconds"))
+        params.setdefault("to", now.isoformat(timespec="seconds"))
+
+    try:
+        data = newsapi_fetch_news(api_key, params)
+    except requests.HTTPError as exc:
+        print(f"[MCQGenerator] Failed to fetch news articles: {exc}")
+        if exc.response is not None:
+            print(exc.response.text)
+        return []
+    except Exception as exc:
+        print(f"[MCQGenerator] Unexpected error fetching news articles: {exc}")
+        return []
+
+    articles = data.get("articles", []) if isinstance(data, dict) else []
+    if limit is not None:
+        articles = articles[:limit]
+
+    print(f"[MCQGenerator] Loaded {len(articles)} news articles for context.")
+    return articles
+
+
+def _note_field_exists(note, field_name: str) -> bool:
+    return field_name in note.keys()
+
+
+def get_note_field(note, field_name: str) -> str:
+    if not _note_field_exists(note, field_name):
+        return ""
+    return (note[field_name] or "").strip()
+
+
+def set_note_field(note, field_name: str, value: str):
+    if not _note_field_exists(note, field_name):
+        return
+    note[field_name] = value
+
+
+def get_word_from_note(note) -> str:
+    """Get word from note, trying 'Word' field first, then 'Front' field."""
+    word = get_note_field(note, "Word")
+    if word:
+        return word
+    return get_note_field(note, "Front")
+
 # ——— Core API Call with Retry Logic ———
-def generate_sentence_for_word(word, max_retries=5):
+def generate_sentence_for_word(
+    word: str,
+    definition: Optional[str] = None,
+    article: Optional[Dict[str, str]] = None,
+    max_retries: int = 5,
+):
     """
     Call OpenAI API to generate a sentence with a blank for the given word/phrase.
     Implements retry logic on HTTP 429 errors.
@@ -70,9 +194,8 @@ def generate_sentence_for_word(word, max_retries=5):
     """
     import time
 
-    level = random.choice(['A1', 'A2', 'B1', 'B2', 'C1', 'C2'])
     try:
-        prompt = PROMPT_TEMPLATE.format(word=word, level=level)
+        prompt = _build_prompt(word, definition, article)
     except Exception as e:
         showInfo(f"Prompt template is invalid: {e}")
         return None
@@ -120,7 +243,7 @@ def generate_sentence_for_word(word, max_retries=5):
         "Content-Type": "application/json"
     }
     payload = {
-        "model": AI_MODEL,  # Example: "gpt-3.5-turbo" or "gpt-4o-mini"
+        "model": AI_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": TEMPERATURE
     }
@@ -154,12 +277,12 @@ def generate_sentence_for_word(word, max_retries=5):
 
 # ——— Helpers ———
 def get_all_deck_words(did):
-    """Collect the 'Word' field from all notes in the given deck."""
+    """Collect the 'Word' or 'Front' field from all notes in the given deck."""
     cids = mw.col.decks.cids(did)
     words = []
     for cid in cids:
         note = mw.col.getCard(cid).note()
-        w = note['Word'].strip()
+        w = get_word_from_note(note)
         if w:
             words.append(w)
     return list(set(words))
@@ -186,20 +309,28 @@ def generate_mcq_for_cards(cids):
     first_card = mw.col.getCard(cids[0])
     deck_words = get_all_deck_words(first_card.did)
     if len(deck_words) < 4:
-        showInfo("Need at least 4 notes with 'Word' field in deck for MCQ generation.")
+        showInfo("Need at least 4 notes with 'Word' or 'Front' field in deck for MCQ generation.")
         return
+
+    articles = load_news_articles(limit=len(cids))
 
     dialog, progress_bar = create_progress_dialog(len(cids))
 
     for index, cid in enumerate(cids, start=1):
         note = mw.col.getCard(cid).note()
-        word = note['Word'].strip()
+        word = get_word_from_note(note)
         if not word:
             continue
         others = [w for w in deck_words if w != word]
         distractors = random.sample(others, 3)
+        definition = get_note_field(note, "Back")
+        article = articles[(index - 1) % len(articles)] if articles else None
         try:
-            sentence = generate_sentence_for_word(word)
+            sentence = generate_sentence_for_word(
+                word,
+                definition=definition,
+                article=article,
+            )
             if sentence is None:
                 continue
         except Exception as e:
@@ -207,11 +338,29 @@ def generate_mcq_for_cards(cids):
             dialog.close()
             mw.col.reset()
             return
+        filled_sentence = sentence.replace("__", word, 1) if sentence else ""
+        filled_sentence = filled_sentence.replace("_", "")
         options = [word] + distractors
         random.shuffle(options)
         note['SentenceBlank'] = sentence
         note['OptionA'], note['OptionB'], note['OptionC'], note['OptionD'] = options
-        note['Answer'] = word
+        note['Answer'] = filled_sentence or word
+
+        if article:
+            title = (article.get("title") or "").strip()
+            description = (
+                article.get("description")
+                or article.get("summary")
+                or ""
+            ).strip()
+            source = article.get("source")
+            if isinstance(source, dict):
+                source_name = (source.get("name") or "").strip()
+            else:
+                source_name = ""
+            article_parts = [part for part in [title, description, source_name] if part]
+            article_value = " — ".join(article_parts)
+            set_note_field(note, "Article", article_value)
         note.flush()
         progress_bar.setValue(index)
         QApplication.processEvents()  # Update the UI
