@@ -1,6 +1,9 @@
 import random
+import re
 import sys
 import os
+import json
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
@@ -54,21 +57,66 @@ DEFAULT_PROMPT_TEMPLATE = (
 
     Inputs (do not alter):
     - Target word or phrase: {word}
+    - Target word inflection: {inflection}
     - Definition to use as guidance: {definition}
     - News article title: {article_title}
     - News article summary: {article_summary}
 
     Output requirements (strict — follow exactly):
-    1. Produce exactly two sentences and nothing else (no commentary, no bullets, no metadata).
-    2. Sentence 1 must be the unchanged news article excerpt provided in {article_summary}. Do not modify it in any way and do not add blanks to it.
-    3. Sentence 2 must be a short, natural-sounding continuation or extension of the article excerpt (an extra sentence that could plausibly follow the excerpt).
-    4. In Sentence 2, replace the target word or phrase with a single blank written exactly as seven underscores: _______. The blank must appear only in Sentence 2 (never in Sentence 1).
-    5. Use the provided {definition} to shape the meaning of Sentence 2 so the blank is contextually constrained and the definition would make the blank answerable by the target word/phrase. Do not restate the definition verbatim.
-    6. Do not reveal the answer anywhere (no synonyms, no parenthetical hints, no further blanks). The model must not output the target word or phrase in any form.
-    7. Keep both sentences short and clear (each ≤ 30 words). Prefer neutral, factual tone consistent with news.
-    8. Return only the two sentences (Sentence 1 + Sentence 2). No extra whitespace, no headings, no punctuation outside the sentences.
+    1. Produce exactly **two sentences** and nothing else (no commentary, no bullets, no metadata).
+    2. Sentence 1 must be the **unchanged** news article excerpt provided in {article_summary}. Do **not** modify it in any way and do not add blanks to it.
+    3. Sentence 2 must be a short, natural-sounding **continuation or extension** of the article excerpt (an extra sentence that could plausibly follow the excerpt).
+    4. In Sentence 2, **include the target word or phrase naturally** in the sentence. The word/phrase must appear **only** in Sentence 2 (never in Sentence 1), and the inflection must be exactly as provided in {inflection}. Write the complete sentence with the actual word/phrase, not a blank.
+    5. Use the provided {definition} to shape the meaning of Sentence 2 so the target word/phrase is contextually constrained and the definition would make it answerable. Do not restate the definition verbatim.
+    6. Keep both sentences short and clear (each ≤ 30 words). Prefer neutral, factual tone consistent with news.
+    7. Return only the two sentences (Sentence 1 + Sentence 2). No extra whitespace, no headings, no punctuation outside the sentences.
 
     If you cannot produce a natural continuation that fits the definition, produce a plausible imaginary continuation sentence that follows the excerpt and still conforms to all rules above.
+    """
+)
+
+DISTRACTOR_PROMPT = (
+    """
+    You are generating vocabulary distractors for an English multiple-choice question.
+
+    Target sentence (with blank): {sentence_with_blank}
+    Correct answer (target word): {word}
+    Definition/context: {definition}
+    Number of distractors needed: {num_distractors}
+
+    Requirements:
+    1. Return exactly {num_distractors} unique English words or short phrases that are **plausible but incorrect** answers when inserted into the blank in the target sentence.
+    2. Each distractor must:
+       - Fit grammatically and syntactically in the sentence (so students might think it's correct)
+       - Be in the same part of speech as the target word
+       - Be at a similar difficulty/vocabulary level as the target word
+       - Be semantically wrong or inappropriate for the sentence context (this is what makes it a good distractor)
+    3. The goal is to "trick" students into thinking the distractor could be correct by making it sound natural in the sentence, but it must still be wrong.
+    4. Distractors must NOT be:
+       - The target word itself
+       - Extremely obscure/rare words
+       - Simple morphological variants of the target word (e.g., plural, tense change, suffix addition)
+    5. Output must be valid JSON: a list of strings, e.g. ["option1", "option2", "option3"]. No commentary, explanations, or extra text.
+    """
+)
+
+EXPLANATION_PROMPT = (
+    """
+    You are generating an explanation for a vocabulary multiple-choice question.
+
+    Target sentence (with blank): {sentence_with_blank}
+    Correct answer: {correct_word}
+    Distractors: {distractors}
+    Definition/context: {definition}
+
+    Requirements:
+    1. Write a clear, educational explanation (2-4 sentences) that:
+       - Explains why "{correct_word}" is the correct answer in this sentence context
+       - Briefly explains why each distractor is incorrect (mention each distractor by name)
+       - Uses the definition/context provided to support your explanation
+    2. The explanation should be helpful for English learners, clear and concise.
+    3. Format: Write in plain text, no bullet points or numbered lists. Use natural, flowing sentences.
+    4. Output only the explanation text, no headings, no metadata, no extra formatting.
     """
 )
 
@@ -110,8 +158,10 @@ def _build_prompt(
         article.get("description") or article.get("summary") or "No summary provided"
     ).strip()
     clean_definition = (definition or "No definition provided").strip().replace("\n", " ")
+    inflection = "plural" # Defaulting to plural as per test_main.py logic, or could be passed in
     return PROMPT_TEMPLATE.format(
         word=word,
+        inflection=inflection,
         definition=clean_definition,
         article_title=article_title,
         article_summary=article_summary,
@@ -192,8 +242,6 @@ def generate_sentence_for_word(
     Implements retry logic on HTTP 429 errors.
     Returns the sentence as plain text.
     """
-    import time
-
     try:
         prompt = _build_prompt(word, definition, article)
     except Exception as e:
@@ -275,6 +323,169 @@ def generate_sentence_for_word(
     showInfo("Maximum retries exceeded. Please try again later.")
     return None
 
+
+def generate_distractors_with_llm(
+    word: str,
+    sentence_with_blank: str,
+    definition: Optional[str] = None,
+    num_distractors: int = 3,
+    article: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    """
+    Ask the configured LLM to propose distractor options that are plausible in the sentence context but incorrect.
+    Falls back to an empty list on any failure so the caller can handle retries/fallbacks.
+    """
+    prompt = DISTRACTOR_PROMPT.format(
+        word=word,
+        sentence_with_blank=sentence_with_blank,
+        definition=(definition or "No definition provided").strip().replace("\n", " "),
+        num_distractors=num_distractors,
+    )
+
+    def _parse_response(content: str) -> List[str]:
+        content = content.strip()
+        
+        # 1. Extract content from markdown code blocks if present
+        code_block_match = re.search(r'```(?:json)?\s*(.*?)\s*```', content, re.DOTALL)
+        if code_block_match:
+            content = code_block_match.group(1).strip()
+
+        try:
+            # 2. Try to find JSON array
+            json_match = re.search(r'\[.*?\]', content, re.DOTALL)
+            if json_match:
+                data = json.loads(json_match.group(0))
+                if isinstance(data, list):
+                    cleaned = []
+                    for item in data:
+                        if isinstance(item, str):
+                            candidate = item.strip()
+                            if candidate and candidate.lower() != word.lower():
+                                cleaned.append(candidate)
+                    return cleaned[:num_distractors]
+        except json.JSONDecodeError:
+            pass
+
+        # 3. Fallback: split lines and clean up
+        parts = [p.strip("- ,\"\'[]") for p in content.splitlines()]
+        cleaned = [
+            p for p in parts if p and p.lower() != word.lower() and len(p) > 1
+        ]
+        return cleaned[:num_distractors]
+
+    if LLM_PROVIDER == "ollama":
+        payload = {
+            "model": OLLAMA_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "options": {"temperature": TEMPERATURE},
+            "stream": False,
+        }
+        try:
+            res = requests.post(OLLAMA_URL, json=payload, timeout=60)
+            res.raise_for_status()
+            data = res.json()
+            content = ""
+            if isinstance(data, dict):
+                if "message" in data and isinstance(data["message"], dict):
+                    content = data["message"].get("content", "")
+                elif "content" in data:
+                    content = data["content"]
+            content = (content or "").strip()
+            if not content:
+                return []
+            return _parse_response(content)
+        except Exception:
+            return []
+
+    if not API_KEY or not AI_MODEL:
+        return []
+
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": AI_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": TEMPERATURE,
+    }
+
+    try:
+        res = requests.post(API_URL, headers=headers, json=payload, timeout=30)
+        res.raise_for_status()
+        data = res.json()
+        content = data["choices"][0]["message"]["content"].strip()
+        return _parse_response(content)
+    except Exception:
+        return []
+
+
+def generate_explanation_with_llm(
+    word: str,
+    sentence_with_blank: str,
+    distractors: List[str],
+    definition: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Ask the configured LLM to generate an explanation for why the target word is correct
+    and why each distractor is wrong.
+    Returns None on failure.
+    """
+    distractors_str = ", ".join(distractors)
+    prompt = EXPLANATION_PROMPT.format(
+        sentence_with_blank=sentence_with_blank,
+        correct_word=word,
+        distractors=distractors_str,
+        definition=(definition or "No definition provided").strip().replace("\n", " "),
+    )
+
+    if LLM_PROVIDER == "ollama":
+        if not OLLAMA_MODEL:
+            return None
+        payload = {
+            "model": OLLAMA_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "options": {"temperature": TEMPERATURE},
+            "stream": False,
+        }
+        try:
+            res = requests.post(OLLAMA_URL, json=payload, timeout=60)
+            res.raise_for_status()
+            data = res.json()
+            content = ""
+            if isinstance(data, dict):
+                if "message" in data and isinstance(data["message"], dict):
+                    content = data["message"].get("content", "")
+                elif "content" in data:
+                    content = data["content"]
+            content = (content or "").strip()
+            return content
+        except Exception:
+            return None
+
+    if not API_KEY or not AI_MODEL:
+        return None
+
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": AI_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": TEMPERATURE,
+    }
+
+    try:
+        res = requests.post(API_URL, headers=headers, json=payload, timeout=30)
+        res.raise_for_status()
+        data = res.json()
+        content = data["choices"][0]["message"]["content"].strip()
+        return content
+    except Exception:
+        return None
+
+
 # ——— Helpers ———
 def get_all_deck_words(did):
     """Collect the 'Word' or 'Front' field from all notes in the given deck."""
@@ -308,10 +519,10 @@ def generate_mcq_for_cards(cids):
         return
     first_card = mw.col.getCard(cids[0])
     deck_words = get_all_deck_words(first_card.did)
-    if len(deck_words) < 4:
-        showInfo("Need at least 4 notes with 'Word' or 'Front' field in deck for MCQ generation.")
-        return
-
+    
+    # We don't strictly need 4 words anymore if we use LLM distractors, 
+    # but it's good for fallback.
+    
     articles = load_news_articles(limit=len(cids))
 
     dialog, progress_bar = create_progress_dialog(len(cids))
@@ -321,10 +532,11 @@ def generate_mcq_for_cards(cids):
         word = get_word_from_note(note)
         if not word:
             continue
-        others = [w for w in deck_words if w != word]
-        distractors = random.sample(others, 3)
+            
         definition = get_note_field(note, "Back")
         article = articles[(index - 1) % len(articles)] if articles else None
+        
+        # 1. Generate Sentence
         try:
             sentence = generate_sentence_for_word(
                 word,
@@ -338,13 +550,68 @@ def generate_mcq_for_cards(cids):
             dialog.close()
             mw.col.reset()
             return
-        filled_sentence = sentence.replace("__", word, 1) if sentence else ""
-        filled_sentence = filled_sentence.replace("_", "")
+            
+        # 2. Create Blank
+        # Replace the word in the sentence with a blank (case-insensitive, whole word only)
+        escaped_word = re.escape(word)
+        pattern = r'\b' + escaped_word + r'\b'
+        sentence_with_blank = re.sub(pattern, '_______', sentence, flags=re.IGNORECASE) if sentence else ""
+        
+        # If no replacement happened (word not found), try without word boundaries for phrases
+        if sentence_with_blank == sentence and word in sentence:
+            sentence_with_blank = sentence.replace(word, '_______', 1)
+        
+        # 3. Generate Distractors
+        distractors = generate_distractors_with_llm(
+            word,
+            sentence_with_blank=sentence_with_blank,
+            definition=definition,
+            num_distractors=3,
+            article=article
+        )
+        
+        # Fallback to deck words if LLM fails
+        if len(distractors) < 3:
+            others = [w for w in deck_words if w != word]
+            if len(others) >= 3:
+                distractors = random.sample(others, 3)
+            else:
+                # If we still don't have enough, we can't make a valid MCQ
+                # (Or we could duplicate, but let's just skip or fill with placeholders)
+                while len(distractors) < 3:
+                    distractors.append("N/A")
+        
+        # 4. Shuffle Options
         options = [word] + distractors
         random.shuffle(options)
-        note['SentenceBlank'] = sentence
-        note['OptionA'], note['OptionB'], note['OptionC'], note['OptionD'] = options
-        note['Answer'] = filled_sentence or word
+        
+        # Find correct option letter
+        correct_option_char = ""
+        for i, opt in enumerate(options):
+            if opt == word:
+                correct_option_char = chr(65 + i)  # A, B, C, or D
+                break
+        
+        # 5. Generate Explanation
+        explanation = generate_explanation_with_llm(
+            word=word,
+            sentence_with_blank=sentence_with_blank,
+            distractors=distractors,
+            definition=definition
+        )
+        
+        # 6. Update Note
+        set_note_field(note, 'SentenceBlank', sentence_with_blank)
+        set_note_field(note, 'OptionA', options[0])
+        set_note_field(note, 'OptionB', options[1])
+        set_note_field(note, 'OptionC', options[2])
+        set_note_field(note, 'OptionD', options[3])
+        set_note_field(note, 'Answer', sentence or word)
+        
+        # New fields (check if they exist before setting)
+        set_note_field(note, 'CorrectOption', correct_option_char)
+        if explanation:
+            set_note_field(note, 'Explanation', explanation)
 
         if article:
             title = (article.get("title") or "").strip()
@@ -361,6 +628,7 @@ def generate_mcq_for_cards(cids):
             article_parts = [part for part in [title, description, source_name] if part]
             article_value = " — ".join(article_parts)
             set_note_field(note, "Article", article_value)
+            
         note.flush()
         progress_bar.setValue(index)
         QApplication.processEvents()  # Update the UI

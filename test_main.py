@@ -13,23 +13,9 @@ import os
 import csv
 import json
 import time
+import re
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional
-
-# Mock Anki components
-class MockMW:
-    """Mock Anki main window"""
-    class MockConfig:
-        def __init__(self):
-            self.config_file = os.path.join(os.path.dirname(__file__), 'config.json')
-            with open(self.config_file, 'r') as f:
-                self._config = json.load(f)
-        
-        def get(self, key, default=None):
-            return self._config.get(key, default)
-    
-    def __init__(self):
-        self.addonManager = self.MockConfig()
 
 # Mock aqt components
 class MockAQT:
@@ -52,7 +38,6 @@ if os.path.exists(_vendor_dir):
 
 # Mock sys.modules before importing
 sys.modules['aqt'] = type(sys)('aqt')
-sys.modules['aqt'].mw = MockMW()
 sys.modules['aqt'].showInfo = MockAQT().showInfo
 sys.modules['aqt.utils'] = type(sys)('aqt.utils')
 sys.modules['aqt.utils'].showInfo = MockAQT().showInfo
@@ -83,9 +68,6 @@ load_dotenv(os.path.join(_addon_dir, ".env"), override=False)
 if os.path.isdir(_user_files_dir):
     load_dotenv(os.path.join(_user_files_dir, ".env"), override=False)
 
-# Load config (for any non-secret defaults the user may keep there)
-config = MockMW().addonManager
-
 # Mirror configuration resolution from main.py
 DEFAULT_PROMPT = (
     """
@@ -93,6 +75,7 @@ DEFAULT_PROMPT = (
 
 Inputs (do not alter):
 - Target word or phrase: {word}
+- Target word inflection: {inflection}
 - Definition to use as guidance: {definition}
 - News article title: {article_title}
 - News article summary: {article_summary}
@@ -101,14 +84,58 @@ Output requirements (strict — follow exactly):
 1. Produce exactly **two sentences** and nothing else (no commentary, no bullets, no metadata).
 2. Sentence 1 must be the **unchanged** news article excerpt provided in {article_summary}. Do **not** modify it in any way and do not add blanks to it.
 3. Sentence 2 must be a short, natural-sounding **continuation or extension** of the article excerpt (an extra sentence that could plausibly follow the excerpt).
-4. In Sentence 2, **replace the target word or phrase with a single blank written exactly as seven underscores**: `_______`. The blank must appear **only** in Sentence 2 (never in Sentence 1).
-5. Use the provided {definition} to shape the meaning of Sentence 2 so the blank is contextually constrained and the definition would make the blank answerable by the target word/phrase. Do not restate the definition verbatim.
-6. Do **not** reveal the answer anywhere (no synonyms, no parenthetical hints, no further blanks). The model must not output the target word or phrase in any form.
-7. Keep both sentences short and clear (each ≤ 30 words). Prefer neutral, factual tone consistent with news.
-8. Return only the two sentences (Sentence 1 + Sentence 2). No extra whitespace, no headings, no punctuation outside the sentences.
+4. In Sentence 2, **include the target word or phrase naturally** in the sentence. The word/phrase must appear **only** in Sentence 2 (never in Sentence 1), and the inflection must be exactly as provided in {inflection}. Write the complete sentence with the actual word/phrase, not a blank.
+5. Use the provided {definition} to shape the meaning of Sentence 2 so the target word/phrase is contextually constrained and the definition would make it answerable. Do not restate the definition verbatim.
+6. Keep both sentences short and clear (each ≤ 30 words). Prefer neutral, factual tone consistent with news.
+7. Return only the two sentences (Sentence 1 + Sentence 2). No extra whitespace, no headings, no punctuation outside the sentences.
 
 If you cannot produce a natural continuation that fits the definition, produce a plausible imaginary continuation sentence that follows the excerpt and still conforms to all rules above.
 
+"""
+)
+
+DISTRACTOR_PROMPT = (
+    """
+You are generating vocabulary distractors for an English multiple-choice question.
+
+Target sentence (with blank): {sentence_with_blank}
+Correct answer (target word): {word}
+Definition/context: {definition}
+Number of distractors needed: {num_distractors}
+
+Requirements:
+1. Return exactly {num_distractors} unique English words or short phrases that are **plausible but incorrect** answers when inserted into the blank in the target sentence.
+2. Each distractor must:
+   - Fit grammatically and syntactically in the sentence (so students might think it's correct)
+   - Be in the same part of speech as the target word
+   - Be at a similar difficulty/vocabulary level as the target word
+   - Be semantically wrong or inappropriate for the sentence context (this is what makes it a good distractor)
+3. The goal is to "trick" students into thinking the distractor could be correct by making it sound natural in the sentence, but it must still be wrong.
+4. Distractors must NOT be:
+   - The target word itself
+   - Extremely obscure/rare words
+   - Simple morphological variants of the target word (e.g., plural, tense change, suffix addition)
+5. Output must be valid JSON: a list of strings, e.g. ["option1", "option2", "option3"]. No commentary, explanations, or extra text.
+"""
+)
+
+EXPLANATION_PROMPT = (
+    """
+You are generating an explanation for a vocabulary multiple-choice question.
+
+Target sentence (with blank): {sentence_with_blank}
+Correct answer: {correct_word}
+Distractors: {distractors}
+Definition/context: {definition}
+
+Requirements:
+1. Write a clear, educational explanation (2-4 sentences) that:
+   - Explains why "{correct_word}" is the correct answer in this sentence context
+   - Briefly explains why each distractor is incorrect (mention each distractor by name)
+   - Uses the definition/context provided to support your explanation
+2. The explanation should be helpful for English learners, clear and concise.
+3. Format: Write in plain text, no bullet points or numbered lists. Use natural, flowing sentences.
+4. Output only the explanation text, no headings, no metadata, no extra formatting.
 """
 )
 
@@ -195,8 +222,10 @@ def _build_prompt(
         article.get("description") or article.get("summary") or "No summary provided"
     ).strip()
     clean_definition = (definition or "No definition provided").strip().replace("\n", " ")
+    inflection = "plural"
     return PROMPT_TEMPLATE.format(
         word=word,
+        inflection=inflection,
         definition=clean_definition,
         article_title=article_title,
         article_summary=article_summary,
@@ -308,6 +337,172 @@ def generate_sentence_for_word(
     return None
 
 
+def generate_distractors_with_llm(
+    word: str,
+    sentence_with_blank: str,
+    definition: Optional[str] = None,
+    num_distractors: int = 3,
+    article: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    """
+    Ask the configured LLM to propose distractor options that are plausible in the sentence context but incorrect.
+    Falls back to an empty list on any failure so the caller can handle retries/fallbacks.
+    """
+    prompt = DISTRACTOR_PROMPT.format(
+        word=word,
+        sentence_with_blank=sentence_with_blank,
+        definition=(definition or "No definition provided").strip().replace("\n", " "),
+        num_distractors=num_distractors,
+    )
+
+    def _parse_response(content: str) -> List[str]:
+        try:
+            data = json.loads(content)
+            if isinstance(data, list):
+                cleaned = []
+                for item in data:
+                    if isinstance(item, str):
+                        candidate = item.strip()
+                        if candidate and candidate.lower() != word.lower():
+                            cleaned.append(candidate)
+                return cleaned[:num_distractors]
+        except json.JSONDecodeError:
+            pass
+        # Fallback: split lines
+        parts = [p.strip("- ").strip() for p in content.splitlines()]
+        cleaned = [
+            p for p in parts if p and p.lower() != word.lower()
+        ]
+        return cleaned[:num_distractors]
+
+    if LLM_PROVIDER == "ollama":
+        payload = {
+            "model": OLLAMA_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "options": {"temperature": TEMPERATURE},
+            "stream": False,
+        }
+        try:
+            print(f"[SLM] Generating distractors for '{word}' using Ollama.")
+            res = requests.post(OLLAMA_URL, json=payload, timeout=60)
+            res.raise_for_status()
+            data = res.json()
+            content = ""
+            if isinstance(data, dict):
+                if "message" in data and isinstance(data["message"], dict):
+                    content = data["message"].get("content", "")
+                elif "content" in data:
+                    content = data["content"]
+            content = (content or "").strip()
+            if not content:
+                print("[ERROR] Empty distractor response from Ollama.")
+                return []
+            return _parse_response(content)
+        except Exception as exc:
+            print(f"[ERROR] Failed to generate distractors via Ollama: {exc}")
+            return []
+
+    if not API_KEY or not AI_MODEL:
+        print("[ERROR] Cannot generate distractors: OpenAI credentials incomplete.")
+        return []
+
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": AI_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": TEMPERATURE,
+    }
+
+    try:
+        print(f"[API] Generating distractors for '{word}'...")
+        res = requests.post(API_URL, headers=headers, json=payload, timeout=30)
+        res.raise_for_status()
+        data = res.json()
+        content = data["choices"][0]["message"]["content"].strip()
+        return _parse_response(content)
+    except Exception as exc:
+        print(f"[ERROR] Failed to generate distractors via API: {exc}")
+        return []
+
+
+def generate_explanation_with_llm(
+    word: str,
+    sentence_with_blank: str,
+    distractors: List[str],
+    definition: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Ask the configured LLM to generate an explanation for why the target word is correct
+    and why each distractor is wrong.
+    Returns None on failure.
+    """
+    distractors_str = ", ".join(distractors)
+    prompt = EXPLANATION_PROMPT.format(
+        sentence_with_blank=sentence_with_blank,
+        correct_word=word,
+        distractors=distractors_str,
+        definition=(definition or "No definition provided").strip().replace("\n", " "),
+    )
+
+    if LLM_PROVIDER == "ollama":
+        if not OLLAMA_MODEL:
+            print("[ERROR] Ollama model is not configured for explanation generation.")
+            return None
+        payload = {
+            "model": OLLAMA_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "options": {"temperature": TEMPERATURE},
+            "stream": False,
+        }
+        try:
+            print(f"[SLM] Generating explanation for '{word}' using Ollama.")
+            res = requests.post(OLLAMA_URL, json=payload, timeout=60)
+            res.raise_for_status()
+            data = res.json()
+            content = ""
+            if isinstance(data, dict):
+                if "message" in data and isinstance(data["message"], dict):
+                    content = data["message"].get("content", "")
+                elif "content" in data:
+                    content = data["content"]
+            content = (content or "").strip()
+            if not content:
+                print("[ERROR] Empty explanation response from Ollama.")
+                return None
+            return content
+        except Exception as exc:
+            print(f"[ERROR] Failed to generate explanation via Ollama: {exc}")
+            return None
+
+    if not API_KEY or not AI_MODEL:
+        print("[ERROR] Cannot generate explanation: OpenAI credentials incomplete.")
+        return None
+
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": AI_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": TEMPERATURE,
+    }
+
+    try:
+        print(f"[API] Generating explanation for '{word}'...")
+        res = requests.post(API_URL, headers=headers, json=payload, timeout=30)
+        res.raise_for_status()
+        data = res.json()
+        content = data["choices"][0]["message"]["content"].strip()
+        return content
+    except Exception as exc:
+        print(f"[ERROR] Failed to generate explanation via API: {exc}")
+        return None
+
+
 def load_csv_data(csv_path: str) -> List[Dict[str, str]]:
     """Load word data from CSV file"""
     words = []
@@ -345,9 +540,6 @@ def generate_mcq_for_words(
         print("[ERROR] Need at least 4 words for MCQ generation.")
         return []
     
-    # Get all words for distractors
-    all_words = [w['Word'] for w in words if w['Word']]
-    
     # Test with first N words
     test_words = words[:test_count]
     results = []
@@ -364,20 +556,12 @@ def generate_mcq_for_words(
         
         print(f"\n[{index}/{len(test_words)}] Processing: {word}")
         
-        # Get distractors from other words
-        others = [w for w in all_words if w != word]
-        if len(others) < 3:
-            print(f"[WARNING] Not enough distractors for {word}, skipping")
-            continue
-        
-        distractors = random.sample(others, 3)
-        
         # Choose article context (cycle if fewer articles than words)
         article = articles[(index - 1) % len(articles)] if articles else None
         if article:
             print(f"  Article: {article.get('title', 'Untitled article')}")
 
-        # Generate sentence
+        # Generate sentence first
         try:
             sentence = generate_sentence_for_word(word, definition=definition, article=article)
             if sentence is None:
@@ -387,21 +571,65 @@ def generate_mcq_for_words(
             print(f"[ERROR] Exception generating sentence for {word}: {e}")
             continue
         
+        # Replace the word in the sentence with a blank (case-insensitive, whole word only)
+        # Create a regex pattern that matches the word as a whole word (case-insensitive)
+        # Escape special regex characters in the word
+        escaped_word = re.escape(word)
+        # Match whole word boundaries, handling punctuation
+        pattern = r'\b' + escaped_word + r'\b'
+        sentence_with_blank = re.sub(pattern, '_______', sentence, flags=re.IGNORECASE) if sentence else ""
+        
+        # If no replacement happened (word not found), try without word boundaries for phrases
+        if sentence_with_blank == sentence and word in sentence:
+            sentence_with_blank = sentence.replace(word, '_______', 1)
+        
+        # Generate distractors via LLM using the sentence context, fallback to CSV words if needed
+        distractors = generate_distractors_with_llm(
+            word, 
+            sentence_with_blank=sentence_with_blank,
+            definition=definition, 
+            num_distractors=3
+        )
+        if len(distractors) < 3:
+            print(f"[WARNING] LLM distractors unavailable for {word}; using CSV fallbacks.")
+            fallback_pool = [w['Word'] for w in words if w['Word'] and w['Word'] != word]
+            if len(fallback_pool) < 3:
+                print(f"[ERROR] Not enough fallback distractors for {word}, skipping")
+                continue
+            distractors = random.sample(fallback_pool, 3)
+        
         # Create options
         options = [word] + distractors
         random.shuffle(options)
         
-        filled_sentence = sentence.replace("_____", word, 1) if sentence else ""
-        filled_sentence = filled_sentence.replace("_", "")
+        # Find which option is the correct answer after shuffling
+        correct_option = None
+        for i, opt in enumerate(options):
+            if opt == word:
+                correct_option = chr(65 + i)  # A, B, C, or D
+                break
+
+        # Generate explanation
+        explanation = generate_explanation_with_llm(
+            word=word,
+            sentence_with_blank=sentence_with_blank,
+            distractors=distractors,
+            definition=definition
+        )
+        if not explanation:
+            print(f"[WARNING] Failed to generate explanation for {word}, continuing without it.")
+            explanation = ""
 
         result = {
             'Word': word,
-            'SentenceBlank': sentence,
+            'SentenceBlank': sentence_with_blank,
             'OptionA': options[0],
             'OptionB': options[1],
             'OptionC': options[2],
             'OptionD': options[3],
-            'Answer': filled_sentence or word,
+            'Answer': sentence or word,
+            'CorrectOption': correct_option or '',
+            'Explanation': explanation,
             'ArticleTitle': article.get('title') if article else '',
             'ArticleSource': ((article or {}).get('source') or {}).get('name', '') if article else '',
             'ArticleDescription': article.get('description') if article else '',
@@ -412,7 +640,9 @@ def generate_mcq_for_words(
         # Display result
         print(f"  Sentence: {sentence}")
         print(f"  Options: A) {options[0]}, B) {options[1]}, C) {options[2]}, D) {options[3]}")
-        print(f"  Answer: {word}")
+        print(f"  Answer: {word} ({correct_option})")
+        if explanation:
+            print(f"  Explanation: {explanation[:100]}...")
     
     return results
 
@@ -431,6 +661,8 @@ def save_results_to_csv(results: List[Dict[str, str]], output_path: str):
         'OptionC',
         'OptionD',
         'Answer',
+        'CorrectOption',
+        'Explanation',
         'ArticleTitle',
         'ArticleSource',
         'ArticleDescription',
