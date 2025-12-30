@@ -2,3 +2,7 @@ python-dotenv>=1.0.0
 pandas
 requests
 lemminflect
+langchain
+langgraph
+langchain-openai
+langchain-community
