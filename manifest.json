@@ -1,9 +1,8 @@
 {
-  "package": "mcq_generator with News",
-  "name": "MCQ Generator with News",
-  "mod": 1,
-  "author": "Karthik Talluri",
-  "description": "Generates MCQs using AI API with News",
-  "version": "1.0.0",
-  "min_point_version": 20120
+  "package": "MCQGeneratorAnki",
+  "name": "MCQ Generator (News & Synonyms)",
+  "api": [
+    "2.1"
+  ],
+  "mod": 123456789
 }
